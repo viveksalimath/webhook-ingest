@@ -86,3 +86,43 @@ func TestUpsertCallThenMarkRecordingProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true")
 	}
 }
+
+func TestIngestEventIdempotent(t *testing.T) {
+	s := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, s)
+	ctx := context.Background()
+
+	evt := store.Event{
+		EventID: eventID, CallID: callID, AccountID: accountID,
+		Status: "completed", DurationSec: 50,
+		RecordingURL: "https://example.com/a.wav", Payload: []byte(`{}`),
+	}
+
+	// First ingestion should insert and return true
+	inserted, err := s.IngestEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("first IngestEvent: %v", err)
+	}
+	if !inserted {
+		t.Fatal("first IngestEvent: expected inserted=true")
+	}
+
+	// Second ingestion with same event_id should be ignored and return false
+	inserted, err = s.IngestEvent(ctx, evt)
+	if err != nil {
+		t.Fatalf("second IngestEvent: %v", err)
+	}
+	if inserted {
+		t.Fatal("second IngestEvent: expected inserted=false")
+	}
+
+	// Stats should only reflect one call
+	stats, err := s.AccountStats(ctx, accountID)
+	if err != nil {
+		t.Fatalf("AccountStats: %v", err)
+	}
+	if stats.CallCount != 1 || stats.TotalDurationSec != 50 {
+		t.Fatalf("stats: got CallCount=%d TotalDurationSec=%d, want 1 and 50", stats.CallCount, stats.TotalDurationSec)
+	}
+}
+
