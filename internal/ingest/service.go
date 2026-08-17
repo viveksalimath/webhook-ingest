@@ -82,6 +82,17 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 	return st
 }
 
+// RecentCalls retrieves the newest call records from the database.
+func (s *Service) RecentCalls(ctx context.Context, limit int) ([]store.CallRecord, error) {
+	return s.store.RecentCalls(ctx, limit)
+}
+
+// Summary returns high-level system metrics.
+func (s *Service) Summary(ctx context.Context) (store.Summary, error) {
+	return s.store.SystemSummary(ctx)
+}
+
+
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {

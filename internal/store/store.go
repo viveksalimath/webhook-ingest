@@ -186,3 +186,59 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 	}
 	return st, nil
 }
+
+// CallRecord represents a stored call record.
+type CallRecord struct {
+	CallID             string    `json:"call_id"`
+	AccountID          string    `json:"account_id"`
+	Status             string    `json:"status"`
+	DurationSec        int       `json:"duration_sec"`
+	RecordingURL       string    `json:"recording_url"`
+	RecordingProcessed bool      `json:"recording_processed"`
+	UpdatedAt          time.Time `json:"updated_at"`
+}
+
+// Summary holds global system totals for monitoring.
+type Summary struct {
+	TotalEvents      int64 `json:"total_events"`
+	TotalCalls       int64 `json:"total_calls"`
+	ProcessedCalls   int64 `json:"processed_calls"`
+	TotalDurationSec int64 `json:"total_duration_sec"`
+	UniqueAccounts   int64 `json:"unique_accounts"`
+}
+
+// RecentCalls returns the most recent calls.
+func (s *Store) RecentCalls(ctx context.Context, limit int) ([]CallRecord, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 20
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT call_id, account_id, status, duration_sec, COALESCE(recording_url, ''), recording_processed, updated_at
+		 FROM calls
+		 ORDER BY updated_at DESC
+		 LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	records := make([]CallRecord, 0)
+	for rows.Next() {
+		var c CallRecord
+		if err := rows.Scan(&c.CallID, &c.AccountID, &c.Status, &c.DurationSec, &c.RecordingURL, &c.RecordingProcessed, &c.UpdatedAt); err != nil {
+			return nil, err
+		}
+		records = append(records, c)
+	}
+	return records, rows.Err()
+}
+
+// SystemSummary returns high-level counts for monitoring.
+func (s *Store) SystemSummary(ctx context.Context) (Summary, error) {
+	var sum Summary
+	_ = s.pool.QueryRow(ctx, `SELECT count(*) FROM events`).Scan(&sum.TotalEvents)
+	_ = s.pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE recording_processed = true) FROM calls`).Scan(&sum.TotalCalls, &sum.ProcessedCalls)
+	_ = s.pool.QueryRow(ctx, `SELECT count(*), COALESCE(sum(total_duration_sec), 0) FROM account_stats`).Scan(&sum.UniqueAccounts, &sum.TotalDurationSec)
+	return sum, nil
+}
+
