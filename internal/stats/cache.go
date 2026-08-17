@@ -35,8 +35,34 @@ func (c *Cache) Get(accountID string) AccountStats {
 	return *s
 }
 
+// Lookup returns an account's totals and a boolean indicating whether it exists in the cache.
+func (c *Cache) Lookup(accountID string) (AccountStats, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	s, ok := c.m[accountID]
+	if !ok {
+		return AccountStats{}, false
+	}
+	return *s, true
+}
+
+// Set stores explicit account totals into the cache.
+func (c *Cache) Set(accountID string, st AccountStats) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.m[accountID] = &AccountStats{
+		CallCount:        st.CallCount,
+		TotalDurationSec: st.TotalDurationSec,
+	}
+}
+
 // Record folds one completed call into an account's running totals.
 func (c *Cache) Record(accountID string, durationSec int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	s, ok := c.m[accountID]
 	if !ok {
 		s = &AccountStats{}
@@ -45,3 +71,4 @@ func (c *Cache) Record(accountID string, durationSec int) {
 	s.CallCount++
 	s.TotalDurationSec += int64(durationSec)
 }
+
