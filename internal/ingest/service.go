@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -18,34 +19,72 @@ const recordingWork = 50 * time.Millisecond
 
 // Service ingests webhook deliveries.
 type Service struct {
-	store *store.Store
-	cache *stats.Cache
-	rdb   *redis.Client
-	log   *slog.Logger
+	store     *store.Store
+	cache     *stats.Cache
+	rdb       *redis.Client
+	log       *slog.Logger
+	jobs      chan store.Event
+	wg        sync.WaitGroup
+	workerCtx context.Context
+	cancel    context.CancelFunc
 }
 
-// New builds a Service.
+// New builds a Service and starts background workers.
 func New(s *store.Store, c *stats.Cache, rdb *redis.Client, log *slog.Logger) *Service {
-	return &Service{store: s, cache: c, rdb: rdb, log: log}
+	workerCtx, cancel := context.WithCancel(context.Background())
+	svc := &Service{
+		store:     s,
+		cache:     c,
+		rdb:       rdb,
+		log:       log,
+		jobs:      make(chan store.Event, 1000),
+		workerCtx: workerCtx,
+		cancel:    cancel,
+	}
+
+	const numWorkers = 5
+	for i := 0; i < numWorkers; i++ {
+		svc.wg.Add(1)
+		go svc.worker()
+	}
+
+	return svc
 }
 
-// Stats returns the cached totals for an account.
+// worker processes recording jobs until the jobs channel is closed.
+func (s *Service) worker() {
+	defer s.wg.Done()
+	for rec := range s.jobs {
+		if err := s.processRecording(s.workerCtx, rec); err != nil {
+			s.log.Error("process recording failed", "call_id", rec.CallID, "err", err)
+		}
+	}
+}
+
+// Stats returns the totals for an account, checking the in-memory cache
+// first and falling back to Postgres on a cold-cache miss.
 func (s *Service) Stats(accountID string) stats.AccountStats {
-	return s.cache.Get(accountID)
+	if st, ok := s.cache.Lookup(accountID); ok {
+		return st
+	}
+
+	dbStats, err := s.store.AccountStats(context.Background(), accountID)
+	if err != nil {
+		s.log.Error("load account stats from store failed", "account_id", accountID, "err", err)
+		return stats.AccountStats{}
+	}
+
+	st := stats.AccountStats{
+		CallCount:        dbStats.CallCount,
+		TotalDurationSec: dbStats.TotalDurationSec,
+	}
+	s.cache.Set(accountID, st)
+	return st
 }
 
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
-
 	payload, err := json.Marshal(evt)
 	if err != nil {
 		return err
@@ -61,32 +100,62 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+
+	inserted, err := s.store.IngestEvent(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
+	if !inserted {
+		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+		return nil
 	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
-	}
+
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
-	// Recordings are slow to fetch, so that part does not block the provider.
+	// Enqueue recording processing asynchronously into worker queue
 	if rec.RecordingURL != "" {
-		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
-			}
-		}()
+		select {
+		case s.jobs <- rec:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 
 	return nil
 }
 
 // processRecording downloads and transcodes the call recording, then marks
-// the call as done.
+// the call as done. It uses a decoupled background context to ensure execution
+// is not aborted when the original HTTP request finishes.
 func (s *Service) processRecording(ctx context.Context, rec store.Event) error {
-	time.Sleep(recordingWork)
-	return s.store.MarkRecordingProcessed(ctx, rec.CallID)
+	jobCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	select {
+	case <-time.After(recordingWork):
+	case <-jobCtx.Done():
+		return jobCtx.Err()
+	}
+
+	return s.store.MarkRecordingProcessed(jobCtx, rec.CallID)
 }
+
+// Shutdown gracefully terminates the service by draining background workers.
+func (s *Service) Shutdown(ctx context.Context) error {
+	close(s.jobs)
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		s.cancel()
+		return ctx.Err()
+	}
+}
+

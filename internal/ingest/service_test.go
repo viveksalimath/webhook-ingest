@@ -4,12 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/convin/webhook-ingest/internal/ingest"
+	"github.com/convin/webhook-ingest/internal/stats"
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
 
@@ -173,4 +177,63 @@ func TestRecordingIsMarkedProcessed(t *testing.T) {
 		t.Fatal("expected recording_processed to be true after background processing")
 	}
 }
+
+func TestGracefulShutdownCompletesInFlightRecordings(t *testing.T) {
+	st := testutil.NewStore(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	svc := ingest.New(st, stats.NewCache(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	evt := ingest.Event{
+		EventID:      eventID,
+		CallID:       callID,
+		AccountID:    accountID,
+		Status:       "completed",
+		DurationSec:  100,
+		RecordingURL: "https://example.com/recording.wav",
+		OccurredAt:   time.Now(),
+	}
+
+	if err := svc.Ingest(ctx, evt); err != nil {
+		t.Fatalf("Ingest: %v", err)
+	}
+
+	// Immediately shutdown service - it should wait for the in-flight recording to finish
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := svc.Shutdown(shutdownCtx); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	var processed bool
+	row := st.Pool().QueryRow(ctx, `SELECT recording_processed FROM calls WHERE call_id = $1`, callID)
+	if err := row.Scan(&processed); err != nil {
+		t.Fatalf("scan recording_processed: %v", err)
+	}
+	if !processed {
+		t.Fatal("expected in-flight recording to be processed before shutdown completed")
+	}
+}
+
+func TestStatsColdCacheReadThrough(t *testing.T) {
+	st := testutil.NewStore(t)
+	_, _, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	// Seed directly in store (as if populated before service start)
+	if err := st.IncrementAccountStats(ctx, accountID, 85); err != nil {
+		t.Fatalf("IncrementAccountStats: %v", err)
+	}
+
+	// Service with a fresh empty cache
+	svc := ingest.New(st, stats.NewCache(), nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	defer func() { _ = svc.Shutdown(context.Background()) }()
+
+	got := svc.Stats(accountID)
+	if got.CallCount != 1 || got.TotalDurationSec != 85 {
+		t.Fatalf("cold stats: got CallCount=%d TotalDurationSec=%d, want 1 and 85", got.CallCount, got.TotalDurationSec)
+	}
+}
+
 
