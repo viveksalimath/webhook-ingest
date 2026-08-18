@@ -92,6 +92,8 @@ An interactive operations dashboard is embedded into the service:
 
 👉 Open **[http://localhost:8080/](http://localhost:8080/)** or **[http://localhost:8080/dashboard](http://localhost:8080/dashboard)** in your browser.
 
+![Operations Dashboard](assets/dashboard.png)
+
 ### Dashboard Features:
 - **Live System KPI Metrics**: Total Ingested Events, Unique Calls, Processed Recordings, Total Duration, Active Accounts.
 - **Interactive Webhook Simulator**:
@@ -100,6 +102,7 @@ An interactive operations dashboard is embedded into the service:
   - *Fire 20 Concurrent Duplicates (Race Test)*: Blast 20 simultaneous duplicate requests in parallel.
 - **Account Stats Consistency Inspector**: Inspect real-time account stats and verify in-memory vs database consistency.
 - **Real-Time Live Call Feed**: Auto-refreshing table displaying calls, durations, and live updating recording transcoding badges.
+
 
 ---
 
